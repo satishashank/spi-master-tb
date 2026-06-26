@@ -1,17 +1,4 @@
 `timescale 1ns/1ps
-class scoreboard;
-    int n;
-    transaction tx_mon,rx_mon,tx_gen,rx_gen;
-    mailbox #(transaction) mbx_tx_mon;
-    mailbox #(transaction) mbx_rx_mon;
-    mailbox #(transaction) mbx_tx_drv;
-    mailbox #(transaction) mbx_rx_drv;
-    function new(int n);
-        this.n = n;
-
-
-endclass
-
 class transaction;
     randc bit [7:0] data;
 
@@ -23,16 +10,57 @@ class transaction;
         $strobe("DATA: %0h", data);
     endfunction
 endclass
+class scoreboard;
+    int n;
+    transaction tx_mon,rx_mon,tx_gen,rx_gen;
+    mailbox #(transaction) mbx_tx_mon;
+    mailbox #(transaction) mbx_rx_mon;
+    mailbox #(transaction) mbx_tx_gen;
+    mailbox #(transaction) mbx_rx_gen;
+    function new(int n, mailbox #(transaction) mbx_tx_mon, mailbox #(transaction) mbx_rx_mon, mailbox #(transaction) mbx_tx_gen, mailbox #(transaction) mbx_rx_gen);
+        this.n = n;
+        this.mbx_tx_mon = mbx_tx_mon;
+        this.mbx_rx_mon = mbx_rx_mon;
+        this.mbx_tx_gen = mbx_tx_gen;
+        this.mbx_rx_gen = mbx_rx_gen;
+    endfunction
+
+    task run();
+        int i,j;
+        fork
+        for(i = 0; i<n; i++) begin
+            mbx_tx_gen.get(tx_gen);
+            mbx_tx_mon.get(tx_mon);
+            assert(tx_mon.data == tx_gen.data) else $error("[SCOREBOARD] TX data mismatch: Monitored: %0h, Generated: %0h", tx_mon.data, tx_gen.data);
+            $display("Tx matched %0d, data: %0h", i+1, tx_mon.data);
+        end
+        for(j = 0; j<n; j++) begin
+            mbx_rx_mon.get(rx_mon);
+            mbx_rx_gen.get(rx_gen);
+            assert(rx_mon.data == rx_gen.data) else $error("[SCOREBOARD] RX data mismatch: Monitored: %0h, Generated: %0h", rx_mon.data, rx_gen.data);
+            $display("Rx matched %0d, data: %0h", j+1, rx_mon.data);
+        end
+        join
+        $display("=== All %0d transactions complete ===", n);
+        $finish;
+    endtask
+endclass
+
+
 
 class generator;
-    mailbox #(transaction) mbx_tx;
-    mailbox #(transaction) mbx_rx;
+    mailbox #(transaction) mbx_tx_sb;
+    mailbox #(transaction) mbx_tx_drv;
+    mailbox #(transaction) mbx_rx_drv;
+    mailbox #(transaction) mbx_rx_sb;
     int n;
     transaction tx,rx;
 
-  function new(int n,mailbox #(transaction) mbx_tx, mailbox #(transaction) mbx_rx);
-    this.mbx_tx = mbx_tx;
-    this.mbx_rx = mbx_rx;
+  function new(int n,mailbox #(transaction) mbx_tx_sb, mailbox #(transaction) mbx_rx_sb, mailbox #(transaction) mbx_tx_drv, mailbox #(transaction) mbx_rx_drv);
+    this.mbx_tx_sb = mbx_tx_sb;
+    this.mbx_rx_sb = mbx_rx_sb;
+    this.mbx_tx_drv = mbx_tx_drv;
+    this.mbx_rx_drv = mbx_rx_drv;
     this.n = n;
     this.tx = new();
     this.rx = new();
@@ -47,8 +75,10 @@ class generator;
       $strobe("[GEN] : DATA SENT TO DRIVER RX");
       tx.display();
       rx.display();
-      mbx_tx.put(tx.copy);
-      mbx_rx.put(rx.copy);
+      mbx_tx_sb.put(tx.copy);
+      mbx_rx_sb.put(rx.copy);
+      mbx_tx_drv.put(tx.copy);
+      mbx_rx_drv.put(rx.copy);
     end
   endtask
 
@@ -71,6 +101,7 @@ class monitor;
         @(posedge vif.i_Clk iff vif.o_RX_DV);
         rx.data = vif.o_RX_Byte;
       	$strobe("[MON:Master] Received data from slave: %0h", rx.data);
+        mbx_rx_sb.put(rx);
     end
     endtask
 
@@ -84,6 +115,7 @@ class monitor;
             tx.data[7-i] = vif.o_SPI_MOSI;
         end
       $strobe("[MON:Slave] Received data from master: %0h", tx.data);
+        mbx_tx_sb.put(tx);
     end
     endtask
 
@@ -91,7 +123,7 @@ class monitor;
             fork
             rcv_data_master();
             rcv_data_slave();
-            join
+            join_none
     endtask
 endclass
 
@@ -171,12 +203,16 @@ endinterface
 module TB;
     spi_if tb_if();       //Central interface
     driver_master tb_driver_master;
-  	transaction tx,rx,tx1,rx1;
     driver_slave tb_driver_slave;
     monitor tb_monitor;
     generator tb_gen;
-    mailbox #(transaction) mbx_tx;
-    mailbox #(transaction) mbx_rx;
+    scoreboard tb_sb;
+    mailbox #(transaction) mbx_tx_gen2drv;
+    mailbox #(transaction) mbx_rx_gen2drv;
+    mailbox #(transaction) mbx_tx_gen2sb;
+    mailbox #(transaction) mbx_rx_gen2sb;
+    mailbox #(transaction) mbx_tx_mon2sb;
+    mailbox #(transaction) mbx_rx_mon2sb;
 
     spi_master dut(
     .i_Rst_L(tb_if.i_Rst_L),
@@ -197,12 +233,20 @@ end
 
 initial begin
     int number = 10; // Number of transactions to generate
-    mbx_tx = new();
-    mbx_rx = new();
-  	tb_driver_master = new(tb_if, mbx_tx);
-    tb_driver_slave = new(tb_if, mbx_rx);
-    tb_monitor = new(tb_if);
-    tb_gen = new(number, mbx_tx, mbx_rx);  // Generate number transactions
+    //mailboxes
+    mbx_tx_gen2drv = new();
+    mbx_rx_gen2drv = new();
+    mbx_tx_gen2sb = new();
+    mbx_rx_gen2sb = new();
+    mbx_tx_mon2sb = new();
+    mbx_rx_mon2sb = new();
+
+    // Instantiate the driver, monitor, generator, and scoreboard
+  	tb_driver_master = new(tb_if, mbx_tx_gen2drv);
+    tb_driver_slave = new(tb_if, mbx_rx_gen2drv);
+    tb_monitor = new(tb_if, mbx_rx_mon2sb, mbx_tx_mon2sb);
+    tb_gen = new(number, mbx_tx_gen2drv, mbx_rx_gen2drv, mbx_tx_gen2sb, mbx_rx_gen2sb);  // Generate number transactions
+    tb_sb = new(number, mbx_tx_mon2sb, mbx_rx_mon2sb,mbx_tx_gen2sb, mbx_rx_gen2sb);
     tb_if.i_Rst_L = 0;
     #20;
     tb_if.i_Rst_L = 1;
@@ -211,6 +255,7 @@ initial begin
           tb_driver_slave.run();
           tb_monitor.run();
           tb_gen.run();
+          tb_sb.run();
         join
     end
 
